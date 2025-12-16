@@ -12,6 +12,7 @@ export default function Home() {
   const [ballPosition, setBallPosition] = useState(0)
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
   const [fileName, setFileName] = useState('Screen Recording 2025-10-06 at 17.21.59.gif')
+  const [defaultFileData, setDefaultFileData] = useState<Uint8Array | null>(null)
   const intervalRef = useRef<NodeJS.Timeout | null>(null)
   const animationRef = useRef<NodeJS.Timeout | null>(null)
 
@@ -47,6 +48,20 @@ export default function Home() {
     }
   }
 
+  // Preload default file on component mount
+  useEffect(() => {
+    const preloadDefaultFile = async () => {
+      try {
+        const fileData = await loadDefaultFile()
+        setDefaultFileData(fileData)
+      } catch (error) {
+        console.error('Failed to preload default file:', error)
+      }
+    }
+
+    preloadDefaultFile()
+  }, [])
+
   const startEncoding = async () => {
     setIsEncoding(true)
 
@@ -57,8 +72,13 @@ export default function Home() {
         // Use selected file
         fileData = new Uint8Array(await selectedFile.arrayBuffer())
       } else {
-        // Use default file
-        fileData = await loadDefaultFile()
+        // Use preloaded default file
+        if (defaultFileData) {
+          fileData = defaultFileData
+        } else {
+          // Fallback: load file on demand if preload failed
+          fileData = await loadDefaultFile()
+        }
       }
 
       // Create Walrus flow - this is the actual blocking operation
