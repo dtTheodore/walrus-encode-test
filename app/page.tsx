@@ -346,7 +346,7 @@ export default function Home() {
                 value={inputValue}
                 onChange={(e) => setInputValue(e.target.value)}
                 placeholder='Type something here'
-                className='w-full px-4 py-3 border border-gray-300 rounded-lg transition-colors text-sm focus:border-gray-900 focus:outline-none placeholder-gray-400'
+                className='w-full px-4 py-3 border border-gray-300 rounded-lg transition-colors text-sm text-gray-900 focus:border-gray-900 focus:outline-none placeholder-gray-400'
               />
               <div className='mt-4'>
                 <p className='text-sm text-gray-700'>
