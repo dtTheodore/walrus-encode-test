@@ -94,6 +94,7 @@ export default function Home() {
       // This encode() call will block the main thread for several seconds
       await flow.encode()
 
+      if (intervalRef.current) clearInterval(intervalRef.current)
       setIsEncoding(false)
     } catch (error) {
       console.error('Encoding failed:', error)
