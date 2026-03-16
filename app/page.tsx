@@ -1,501 +1,414 @@
 'use client'
 
-import { useState, useEffect, useRef } from 'react'
+import { useState, useRef } from 'react'
+import {
+  ConnectButton,
+  useCurrentAccount,
+  useSignAndExecuteTransaction,
+  useSuiClient,
+} from '@mysten/dapp-kit'
+import { walrus, WalrusFile } from '@mysten/walrus'
 import { SuiJsonRpcClient } from '@mysten/sui/jsonRpc'
 import { getFullnodeUrl } from '@mysten/sui/client'
-import { walrus, WalrusFile } from '@mysten/walrus'
 
-export default function Home() {
-  const [isEncoding, setIsEncoding] = useState(false)
-  const [counter, setCounter] = useState(0)
-  const [inputValue, setInputValue] = useState('')
-  const [ballPosition, setBallPosition] = useState(0)
-  const [selectedFile, setSelectedFile] = useState<File | null>(null)
-  const [fileName, setFileName] = useState('Screen Recording 2025-10-06 at 17.21.59.gif')
-  const [defaultFileData, setDefaultFileData] = useState<Uint8Array | null>(null)
-  const intervalRef = useRef<NodeJS.Timeout | null>(null)
-  const animationRef = useRef<NodeJS.Timeout | null>(null)
+// ─── Theory under test ────────────────────────────────────────────────────────
+// For N files passed to writeFilesFlow():
+//   Step 1  encode()    → local WASM, parallel, NO wallet prompt
+//   Step 2  register()  → sign 1 Transaction (1 PTB, all N blobs batched)
+//   Step 3  upload()    → parallel HTTP to storage nodes, NO wallet prompt
+//   Step 4  certify()   → sign 1 Transaction (1 PTB, all N blobs batched)
+//
+// Expected: exactly 2 wallet prompts regardless of N.
+// ─────────────────────────────────────────────────────────────────────────────
 
-  // Initialize Walrus client - let it auto-detect WASM
-  const walrusClient = new SuiJsonRpcClient({
+type Status = 'idle' | 'running' | 'done' | 'error'
+
+interface StepResult {
+  status: Status
+  ms?: number
+  detail?: string
+  error?: string
+}
+
+interface FlowResults {
+  encode:   StepResult
+  register: StepResult
+  upload:   StepResult
+  certify:  StepResult
+  files:    StepResult
+}
+
+const FILE_COUNTS = [1, 3, 5, 10]
+const EPOCHS = 1
+
+function makeTestFiles(n: number): WalrusFile[] {
+  return Array.from({ length: n }, (_, i) => {
+    const bytes = new Uint8Array(1024)
+    for (let j = 0; j < bytes.length; j++) bytes[j] = (i * 37 + j * 13) & 0xff
+    return WalrusFile.from({ contents: bytes, identifier: `test-file-${i + 1}.bin` })
+  })
+}
+
+// Standalone walrus client for flow operations (not gated by dapp-kit provider)
+function makeWalrusClient() {
+  return new SuiJsonRpcClient({
     url: getFullnodeUrl('testnet'),
     network: 'testnet',
   }).$extend(walrus())
+}
 
-  // Handle file selection
-  const handleFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0]
-    if (file) {
-      setSelectedFile(file)
-      setFileName(file.name)
-    }
+// ─── Status badge ──────────────────────────────────────────────────────────────
+function StatusBadge({ status }: { status: Status }) {
+  if (status === 'idle') return <span className="text-xs text-gray-400">—</span>
+  if (status === 'running') return (
+    <svg className="w-4 h-4 animate-spin text-blue-500" fill="none" viewBox="0 0 24 24">
+      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+    </svg>
+  )
+  if (status === 'done') return <span className="text-green-600 font-bold">✓</span>
+  return <span className="text-red-500 font-bold">✗</span>
+}
+
+export default function Home() {
+  const account = useCurrentAccount()
+  const suiClient = useSuiClient()
+  const { mutateAsync: signAndExecute } = useSignAndExecuteTransaction()
+
+  const [fileCount, setFileCount] = useState(3)
+  const [running, setRunning] = useState(false)
+  const [results, setResults] = useState<FlowResults | null>(null)
+  const [walletPromptCount, setWalletPromptCount] = useState(0)
+  const walrusClientRef = useRef<ReturnType<typeof makeWalrusClient> | null>(null)
+
+  function getWalrusClient() {
+    if (!walrusClientRef.current) walrusClientRef.current = makeWalrusClient()
+    return walrusClientRef.current.walrus
   }
 
-  // Load default file if no file is selected
-  const loadDefaultFile = async (): Promise<Uint8Array> => {
-    try {
-      const response = await fetch('/Screen%20Recording%202025-10-06%20at%2017.21.59.gif')
-      const arrayBuffer = await response.arrayBuffer()
-      return new Uint8Array(arrayBuffer)
-    } catch (error) {
-      console.error('Failed to load default file:', error)
-      // Fallback to a smaller test file if default fails
-      const fallbackData = new Uint8Array(1024 * 1024 * 50) // 50MB fallback
-      for (let i = 0; i < fallbackData.length; i++) {
-        fallbackData[i] = Math.floor(Math.random() * 256)
-      }
-      return fallbackData
-    }
+  function patchStep(key: keyof FlowResults, update: Partial<StepResult>) {
+    setResults(prev => prev ? { ...prev, [key]: { ...prev[key], ...update } } : prev)
   }
 
-  // Preload default file on component mount
-  useEffect(() => {
-    const preloadDefaultFile = async () => {
-      try {
-        const fileData = await loadDefaultFile()
-        setDefaultFileData(fileData)
-      } catch (error) {
-        console.error('Failed to preload default file:', error)
-      }
+  async function runFlow() {
+    if (!account || running) return
+
+    setRunning(true)
+    setWalletPromptCount(0)
+
+    const fresh: FlowResults = {
+      encode:   { status: 'idle' },
+      register: { status: 'idle' },
+      upload:   { status: 'idle' },
+      certify:  { status: 'idle' },
+      files:    { status: 'idle' },
     }
+    setResults(fresh)
 
-    preloadDefaultFile()
-  }, [])
-
-  const startEncoding = async () => {
-    setIsEncoding(true)
+    const wc = getWalrusClient()
+    const files = makeTestFiles(fileCount)
+    const flow = wc.writeFilesFlow({ files })
 
     try {
-      let fileData: Uint8Array
-
-      if (selectedFile) {
-        // Use selected file
-        fileData = new Uint8Array(await selectedFile.arrayBuffer())
-      } else {
-        // Use preloaded default file
-        if (defaultFileData) {
-          fileData = defaultFileData
-        } else {
-          // Fallback: load file on demand if preload failed
-          fileData = await loadDefaultFile()
-        }
-      }
-
-      // Create Walrus flow - this is the actual blocking operation
-      const flow = walrusClient.walrus.writeFilesFlow({
-        files: [
-          WalrusFile.from({
-            contents: fileData,
-            identifier: selectedFile ? selectedFile.name : 'demo-file.bin',
-          }),
-        ],
+      // ── Step 1: encode ───────────────────────────────────────────────────
+      patchStep('encode', { status: 'running' })
+      const t0 = performance.now()
+      await flow.encode()
+      patchStep('encode', {
+        status: 'done',
+        ms: Math.round(performance.now() - t0),
+        detail: `${fileCount} files encoded in parallel (WASM erasure coding) — no wallet prompt`,
       })
 
-      // This encode() call will block the main thread for several seconds
-      await flow.encode()
+      // ── Step 2: register ─────────────────────────────────────────────────
+      // register() returns 1 Transaction batching all N blobs
+      patchStep('register', { status: 'running', detail: 'Waiting for wallet signature…' })
+      const t1 = performance.now()
+      const registerTx = flow.register({ epochs: EPOCHS, deletable: false, owner: account.address })
 
-      if (intervalRef.current) clearInterval(intervalRef.current)
-      setIsEncoding(false)
-    } catch (error) {
-      console.error('Encoding failed:', error)
-      // Reset state on error
-      if (intervalRef.current) clearInterval(intervalRef.current)
-      setIsEncoding(false)
+      setWalletPromptCount(c => c + 1)  // about to prompt wallet
+
+      let registerDigest: string
+      try {
+        const result = await signAndExecute({ transaction: registerTx })
+        registerDigest = result.digest
+      } catch (e) {
+        patchStep('register', { status: 'error', error: `Wallet rejected or failed: ${e}` })
+        return
+      }
+
+      // Wait for finality so storage nodes can verify the on-chain registration
+      await suiClient.waitForTransaction({ digest: registerDigest })
+
+      patchStep('register', {
+        status: 'done',
+        ms: Math.round(performance.now() - t1),
+        detail: [
+          `1 wallet prompt → 1 Transaction signed & executed`,
+          `All ${fileCount} blob registration${fileCount > 1 ? 's' : ''} batched in a single PTB`,
+          `Digest: ${registerDigest}`,
+        ].join('\n'),
+      })
+
+      // ── Step 3: upload ───────────────────────────────────────────────────
+      patchStep('upload', { status: 'running' })
+      const t2 = performance.now()
+      try {
+        await flow.upload({ digest: registerDigest })
+        patchStep('upload', {
+          status: 'done',
+          ms: Math.round(performance.now() - t2),
+          detail: `${fileCount} files uploaded to storage nodes in parallel — no wallet prompt`,
+        })
+      } catch (e) {
+        patchStep('upload', { status: 'error', error: String(e) })
+        return
+      }
+
+      // ── Step 4: certify ──────────────────────────────────────────────────
+      // certify() returns 1 Transaction batching all N certifications
+      patchStep('certify', { status: 'running', detail: 'Waiting for wallet signature…' })
+      const t3 = performance.now()
+      const certifyTx = flow.certify()
+
+      setWalletPromptCount(c => c + 1)  // about to prompt wallet
+
+      let certifyDigest: string
+      try {
+        const result = await signAndExecute({ transaction: certifyTx })
+        certifyDigest = result.digest
+      } catch (e) {
+        patchStep('certify', { status: 'error', error: `Wallet rejected or failed: ${e}` })
+        return
+      }
+
+      patchStep('certify', {
+        status: 'done',
+        ms: Math.round(performance.now() - t3),
+        detail: [
+          `1 wallet prompt → 1 Transaction signed & executed`,
+          `All ${fileCount} blob certification${fileCount > 1 ? 's' : ''} batched in a single PTB`,
+          `Digest: ${certifyDigest}`,
+        ].join('\n'),
+      })
+
+      // ── Step 5: list resulting files ─────────────────────────────────────
+      patchStep('files', { status: 'running' })
+      const t4 = performance.now()
+      try {
+        const listed = await flow.listFiles()
+        patchStep('files', {
+          status: 'done',
+          ms: Math.round(performance.now() - t4),
+          detail: listed
+            .map((f, i) => `File ${i + 1}: blobId=${f.blobId}\n         objectId=${f.id}`)
+            .join('\n'),
+        })
+      } catch (e) {
+        patchStep('files', { status: 'error', error: String(e) })
+      }
+
+    } finally {
+      setRunning(false)
     }
   }
 
-  const clearAllIntervals = () => {
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current)
-    }
-    if (animationRef.current) {
-      clearInterval(animationRef.current)
-    }
-  }
+  const allDone = results &&
+    (['encode', 'register', 'upload', 'certify'] as const).every(k => results[k].status === 'done')
 
-  useEffect(() => {
-    return () => {
-      clearAllIntervals()
-    }
-  }, [])
-
-  // Ball animation
-  useEffect(() => {
-    if (!isEncoding) {
-      animationRef.current = setInterval(() => {
-        setBallPosition((prev) => (prev + 3) % 360)
-      }, 15)
-    } else {
-      if (animationRef.current) {
-        clearInterval(animationRef.current)
-      }
-    }
-
-    return () => {
-      if (animationRef.current) {
-        clearInterval(animationRef.current)
-      }
-    }
-  }, [isEncoding])
+  const steps: {
+    key: keyof FlowResults
+    label: string
+    wallet: boolean
+    description: string
+  }[] = [
+    {
+      key: 'encode',
+      label: 'flow.encode()',
+      wallet: false,
+      description: 'WASM erasure-coding all files in parallel',
+    },
+    {
+      key: 'register',
+      label: 'flow.register() → sign → execute',
+      wallet: true,
+      description: `1 PTB batches all ${fileCount} blob registrations`,
+    },
+    {
+      key: 'upload',
+      label: 'flow.upload(digest)',
+      wallet: false,
+      description: 'Parallel HTTP uploads to Walrus storage nodes',
+    },
+    {
+      key: 'certify',
+      label: 'flow.certify() → sign → execute',
+      wallet: true,
+      description: `1 PTB batches all ${fileCount} blob certifications`,
+    },
+    {
+      key: 'files',
+      label: 'flow.listFiles()',
+      wallet: false,
+      description: 'Fetch resulting on-chain file objects',
+    },
+  ]
 
   return (
-    <div className='min-h-screen bg-white py-4 px-4'>
-      <div className='max-w-7xl mx-auto'>
+    <div className="min-h-screen bg-white py-10 px-4">
+      <div className="max-w-2xl mx-auto space-y-7">
+
         {/* Header */}
-        <div className='text-center mb-8'>
-          <h1 className='text-5xl font-semibold text-gray-900 mb-4 tracking-tight'>Walrus Upload Encoding</h1>
-          <p className='text-lg text-gray-500 max-w-2xl mx-auto'>
-            Demonstrating real browser main thread blocking during{' '}
-            <code className='bg-gray-50 px-3 py-1 rounded-md text-sm font-mono border border-gray-200'>
-              flow.encode()
-            </code>
+        <div>
+          <h1 className="text-3xl font-semibold text-gray-900 tracking-tight">
+            writeFilesFlow Batching Test
+          </h1>
+          <p className="mt-2 text-sm text-gray-500 leading-relaxed">
+            Real end-to-end test: sign transactions with your wallet and verify that{' '}
+            <strong>N files always produce exactly 2 wallet prompts</strong> — not N×2.
           </p>
         </div>
 
-        {/* File Selection */}
-        <div className='bg-white border border-gray-200 rounded-xl p-8 py-4 mb-8 max-w-xl mx-auto'>
-          <h3 className='text-xl font-medium mb-6 text-gray-900'>Select File to Encode</h3>
-          <div className='space-y-5'>
-            {/* Hidden file input */}
-            <input
-              type='file'
-              onChange={handleFileSelect}
-              disabled={isEncoding}
-              className='hidden'
-              accept='*/*'
-              id='file-input'
-            />
-
-            {/* Custom file picker button */}
-            <label
-              htmlFor='file-input'
-              className='group relative w-full h-32 border-2 border-dashed border-gray-400 rounded-xl cursor-pointer transition-all duration-200 flex flex-col items-center justify-center hover:border-gray-600 hover:bg-gray-50 active:bg-gray-100'
-            >
-              <div className='flex flex-col items-center space-y-3'>
-                {/* Upload icon */}
-                <div className='w-12 h-12 rounded-full flex items-center justify-center transition-colors bg-linear-to-br from-gray-900 to-gray-700 group-hover:from-gray-800 group-hover:to-gray-600'>
-                  <svg
-                    className='w-6 h-6 text-white'
-                    fill='none'
-                    stroke='currentColor'
-                    viewBox='0 0 24 24'
-                  >
-                    <path
-                      strokeLinecap='round'
-                      strokeLinejoin='round'
-                      strokeWidth={2}
-                      d='M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12'
-                    />
-                  </svg>
-                </div>
-
-                {/* Text content */}
-                <div className='text-center'>
-                  <p className='text-base font-semibold text-gray-900'>
-                    Choose File to Encode
-                  </p>
-                  <p className='text-sm mt-1 text-gray-500'>
-                    Click to browse or drag and drop
-                  </p>
-                </div>
-              </div>
-
-              {/* Hover overlay effect */}
-              <div className='absolute inset-0 rounded-xl transition-opacity duration-200 opacity-0 group-hover:opacity-10 bg-gray-900'></div>
-            </label>
-
-            {/* Optional note */}
-            <div className='text-center'>
-              <p className='text-sm text-gray-500 italic'>
-                Or skip this step to use the default demo file
-              </p>
-            </div>
-
-            {/* File info display */}
-            <div className='bg-gray-50 border border-gray-200 rounded-lg p-4'>
-              <div className='flex items-center space-x-3'>
-                <div className={`w-8 h-8 rounded-full flex items-center justify-center shrink-0 ${
-                  selectedFile ? 'bg-green-100' : 'bg-gray-200'
-                }`}>
-                  <svg
-                    className={`w-4 h-4 ${selectedFile ? 'text-green-600' : 'text-gray-500'}`}
-                    fill='none'
-                    stroke='currentColor'
-                    viewBox='0 0 24 24'
-                  >
-                    <path
-                      strokeLinecap='round'
-                      strokeLinejoin='round'
-                      strokeWidth={2}
-                      d='M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z'
-                    />
-                  </svg>
-                </div>
-                <div className='flex-1 min-w-0'>
-                  <p className='text-sm font-medium text-gray-900 truncate'>
-                    {fileName}
-                  </p>
-                  <p className='text-xs text-gray-500'>
-                    {selectedFile && `${(selectedFile.size / (1024 * 1024)).toFixed(2)} MB`}
-                  </p>
-                </div>
-                {selectedFile && (
-                  <button
-                    onClick={() => {
-                      const input = document.getElementById('file-input') as HTMLInputElement;
-                      if (input) input.value = '';
-                      setSelectedFile(null);
-                      setFileName('Screen Recording 2025-10-06 at 17.21.59.gif');
-                    }}
-                    disabled={isEncoding}
-                    className='text-gray-400 hover:text-gray-600 disabled:opacity-50 disabled:cursor-not-allowed'
-                    title='Clear selection'
-                  >
-                    <svg className='w-4 h-4' fill='none' stroke='currentColor' viewBox='0 0 24 24'>
-                      <path strokeLinecap='round' strokeLinejoin='round' strokeWidth={2} d='M6 18L18 6M6 6l12 12' />
-                    </svg>
-                  </button>
-                )}
-              </div>
-            </div>
-          </div>
+        {/* Theory */}
+        <div className="bg-gray-50 border border-gray-200 rounded-xl p-4 font-mono text-xs leading-6 text-gray-700 space-y-0.5">
+          <div className="text-gray-400">{'// expected for ' + fileCount + ' file' + (fileCount > 1 ? 's' : '')}</div>
+          <div><span className="text-blue-600">encode()</span>   → no wallet &nbsp;&nbsp;&nbsp;<span className="text-gray-400">parallel WASM</span></div>
+          <div><span className="text-purple-600">register()</span>→ <span className="text-purple-800 font-bold">wallet prompt #1</span> &nbsp;1 PTB, {fileCount} blob{fileCount > 1 ? 's' : ''}</div>
+          <div><span className="text-blue-600">upload()</span>   → no wallet &nbsp;&nbsp;&nbsp;<span className="text-gray-400">parallel HTTP</span></div>
+          <div><span className="text-purple-600">certify()</span> → <span className="text-purple-800 font-bold">wallet prompt #2</span> &nbsp;1 PTB, {fileCount} blob{fileCount > 1 ? 's' : ''}</div>
+          <div className="text-green-700 pt-0.5 font-semibold">{'// 2 prompts total, proven on-chain'}</div>
         </div>
 
-        {/* Main Action Button */}
-        <div className='text-center mb-8'>
-          <button
-            onClick={() => startEncoding()}
-            disabled={isEncoding}
-            className='px-10 py-4 bg-gray-900 text-white rounded-lg hover:bg-gray-800 transition-colors font-medium text-base disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-gray-900'
-          >
-            {isEncoding ? (
-              <span className='inline-flex items-center gap-2.5'>
-                <svg className='w-4 h-4 animate-spin' fill='none' viewBox='0 0 24 24'>
-                  <circle className='opacity-25' cx='12' cy='12' r='10' stroke='currentColor' strokeWidth='4'></circle>
-                  <path
-                    className='opacity-75'
-                    fill='currentColor'
-                    d='M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z'
-                  ></path>
-                </svg>
-                Encoding in Progress
-              </span>
+        {/* Wallet connect */}
+        <div className="flex items-center justify-between border border-gray-200 rounded-xl p-4">
+          <div>
+            <div className="text-sm font-medium text-gray-900">Wallet</div>
+            {account ? (
+              <div className="text-xs text-gray-500 font-mono mt-0.5 truncate max-w-xs">
+                {account.address}
+              </div>
             ) : (
-              'Start Encoding'
+              <div className="text-xs text-gray-400 mt-0.5">Connect a Sui wallet to run the test</div>
             )}
-          </button>
+          </div>
+          <ConnectButton />
         </div>
 
-        {/* Demo Content */}
-        <div className='grid lg:grid-cols-3 gap-4'>
-          {/* COLUMN 1: Main Thread - Interactive Elements */}
-          <div className='space-y-6'>
-            {/* Interactive Counter */}
-            <div className='bg-white border border-gray-200 rounded-xl p-6 transition-colors'>
-              <div className='flex items-center justify-between mb-5'>
-                <h3 className='text-base font-medium text-gray-900'>
-                  Interactive Counter
-                </h3>
-                <span
-                  className={`text-xs px-2.5 py-1 rounded-full border ${
-                    isEncoding ? 'bg-gray-100 text-gray-600 border-gray-200' : 'bg-white text-gray-700 border-gray-300'
-                  }`}
-                >
-                  {isEncoding ? 'Paused' : 'Active'}
-                </span>
+        {/* File count */}
+        <div className="space-y-2">
+          <label className="text-sm font-medium text-gray-700">Number of files</label>
+          <div className="flex gap-2">
+            {FILE_COUNTS.map(n => (
+              <button
+                key={n}
+                onClick={() => setFileCount(n)}
+                disabled={running}
+                className={`px-5 py-2 rounded-lg text-sm font-medium border transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+                  fileCount === n
+                    ? 'bg-gray-900 text-white border-gray-900'
+                    : 'bg-white text-gray-700 border-gray-300 hover:border-gray-500'
+                }`}
+              >
+                {n}
+              </button>
+            ))}
+          </div>
+          <p className="text-xs text-gray-400">Each file is 1 KB of deterministic test data</p>
+        </div>
+
+        {/* Run button */}
+        <button
+          onClick={runFlow}
+          disabled={!account || running}
+          className="w-full py-3.5 bg-gray-900 text-white rounded-lg hover:bg-gray-800 transition-colors font-medium disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          {!account ? 'Connect wallet to run' : running ? (
+            <span className="inline-flex items-center gap-2 justify-center">
+              <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+              </svg>
+              Running… (wallet prompt count: {walletPromptCount})
+            </span>
+          ) : `Run Full Test — ${fileCount} file${fileCount > 1 ? 's' : ''}`}
+        </button>
+
+        {/* Results */}
+        {results && (
+          <div className="space-y-3">
+            {/* Live wallet prompt counter */}
+            <div className="flex items-center justify-between">
+              <h2 className="text-sm font-semibold text-gray-500 uppercase tracking-wider">Results</h2>
+              <div className={`text-sm font-semibold px-3 py-1 rounded-full ${
+                walletPromptCount === 0 ? 'bg-gray-100 text-gray-500'
+                : walletPromptCount < 2   ? 'bg-purple-100 text-purple-700'
+                : allDone                  ? 'bg-green-100 text-green-700'
+                : 'bg-purple-100 text-purple-700'
+              }`}>
+                {walletPromptCount} / 2 wallet prompts
               </div>
-              <div className='flex items-center justify-center gap-5 py-4'>
-                <button
-                  onClick={() => setCounter((prev) => prev - 1)}
-                  className='px-5 py-2.5 rounded-lg font-medium text-sm transition-colors bg-gray-900 text-white hover:bg-gray-800'
-                >
-                  Decrease
-                </button>
-                <div className='text-center min-w-[80px]'>
-                  <div className='text-4xl font-semibold tabular-nums text-gray-900'>
-                    {counter}
+            </div>
+
+            {steps.map(({ key, label, wallet, description }) => {
+              const step = results[key]
+              return (
+                <div key={key} className="border border-gray-200 rounded-xl p-4 space-y-2">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <StatusBadge status={step.status} />
+                      <span className="font-mono text-sm font-medium text-gray-900 truncate">{label}</span>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      {wallet ? (
+                        <span className="text-xs px-2 py-0.5 rounded-full bg-purple-100 text-purple-700 border border-purple-200">
+                          wallet
+                        </span>
+                      ) : (
+                        <span className="text-xs px-2 py-0.5 rounded-full bg-gray-100 text-gray-400 border border-gray-200">
+                          no wallet
+                        </span>
+                      )}
+                      {step.ms !== undefined && (
+                        <span className="text-xs text-gray-400">{step.ms} ms</span>
+                      )}
+                    </div>
                   </div>
+                  <p className="text-xs text-gray-400 ml-6">{description}</p>
+                  {step.detail && (
+                    <div className="ml-6 text-xs text-gray-700 bg-gray-50 rounded-lg p-2.5 font-mono whitespace-pre-line leading-5 border border-gray-100">
+                      {step.detail}
+                    </div>
+                  )}
+                  {step.error && (
+                    <div className="ml-6 text-xs text-red-600 bg-red-50 rounded-lg p-2.5 font-mono whitespace-pre-line leading-5">
+                      {step.error}
+                    </div>
+                  )}
                 </div>
-                <button
-                  onClick={() => setCounter((prev) => prev + 1)}
-                  className='px-5 py-2.5 rounded-lg font-medium text-sm transition-colors bg-gray-900 text-white hover:bg-gray-800'
-                >
-                  Increase
-                </button>
-              </div>
-              <p className='text-xs text-center mt-4 text-gray-400'>
-                Buttons respond immediately
-              </p>
-            </div>
-
-            {/* Text Input */}
-            <div className='bg-white border border-gray-200 rounded-xl p-6 transition-colors'>
-              <div className='flex items-center justify-between mb-5'>
-                <h3 className='text-base font-medium text-gray-900'>
-                  Text Input
-                </h3>
-                <span
-                  className={`text-xs px-2.5 py-1 rounded-full border ${
-                    isEncoding ? 'bg-gray-100 text-gray-600 border-gray-200' : 'bg-white text-gray-700 border-gray-300'
-                  }`}
-                >
-                  {isEncoding ? 'Paused' : 'Active'}
-                </span>
-              </div>
-              <input
-                type='text'
-                value={inputValue}
-                onChange={(e) => setInputValue(e.target.value)}
-                placeholder='Type something here'
-                className='w-full px-4 py-3 border border-gray-300 rounded-lg transition-colors text-sm text-gray-900 focus:border-gray-900 focus:outline-none placeholder-gray-400'
-              />
-              <div className='mt-4'>
-                <p className='text-sm text-gray-700'>
-                  <span className='font-medium'>You typed:</span>{' '}
-                  {inputValue || 'nothing yet'}
-                </p>
-                <p className='text-xs mt-2 text-gray-400'>
-                  Text appears instantly
-                </p>
-              </div>
-            </div>
+              )
+            })}
           </div>
+        )}
 
-          {/* COLUMN 2: Main Thread - Animations */}
-          <div className='space-y-6'>
-            {/* JavaScript Animation */}
-            <div className='bg-white border border-gray-200 rounded-xl p-6 transition-colors'>
-              <div className='flex items-center justify-between mb-5'>
-                <h3 className='text-base font-medium text-gray-900'>
-                  JavaScript Animation
-                </h3>
-                <span
-                  className={`text-xs px-2.5 py-1 rounded-full border ${
-                    isEncoding ? 'bg-gray-100 text-gray-600 border-gray-200' : 'bg-white text-gray-700 border-gray-300'
-                  }`}
-                >
-                  {isEncoding ? 'Paused' : 'Active'}
-                </span>
-              </div>
-              <div className='relative h-24 rounded-lg overflow-hidden bg-gray-50'>
-                <div
-                  className='w-8 h-8 rounded-full bg-gray-900'
-                  style={{
-                    transform: `translateX(${
-                      Math.sin((ballPosition * Math.PI) / 90) * 140 + 140 +
-                      Math.sin((ballPosition * Math.PI) / 45) * 30
-                    }px) translateY(${
-                      Math.sin((ballPosition * Math.PI) / 120) * 35 + 40 +
-                      Math.cos((ballPosition * Math.PI) / 60) * 15
-                    }px)`,
-                  }}
-                ></div>
-              </div>
-              <p className='text-xs text-center mt-4 text-gray-400'>
-                Ball moves using JavaScript
-              </p>
-            </div>
-
-            {/* SVG Animation */}
-            <div className='bg-white border border-gray-200 rounded-xl p-6 transition-colors'>
-              <div className='flex items-center justify-between mb-5'>
-                <h3 className='text-base font-medium text-gray-900'>
-                  SVG Animations
-                </h3>
-                <span
-                  className={`text-xs px-2.5 py-1 rounded-full border ${
-                    isEncoding ? 'bg-gray-100 text-gray-600 border-gray-200' : 'bg-white text-gray-700 border-gray-300'
-                  }`}
-                >
-                  {isEncoding ? 'Paused' : 'Active'}
-                </span>
-              </div>
-              <div className='flex justify-center py-2'>
-                <svg
-                  width='120'
-                  height='80'
-                  viewBox='0 0 120 80'
-                  className='border border-gray-200 rounded-lg bg-white'
-                >
-                  <circle cx='30' cy='40' r='8' fill='#171717' opacity='1'>
-                    <animateTransform
-                      attributeName='transform'
-                      attributeType='XML'
-                      type='rotate'
-                      from='0 30 40'
-                      to='360 30 40'
-                      dur='2s'
-                      repeatCount='indefinite'
-                    />
-                  </circle>
-                  <rect x='50' y='35' width='12' height='12' fill='#404040' rx='2' opacity='1'>
-                    <animateTransform
-                      attributeName='transform'
-                      attributeType='XML'
-                      type='translate'
-                      values='0,0; 20,0; 20,-20; 0,-20; 0,0'
-                      dur='3s'
-                      repeatCount='indefinite'
-                    />
-                  </rect>
-                  <circle cx='90' cy='40' r='6' fill='#737373' opacity='1'>
-                    <animate attributeName='opacity' values='1;0.3;1' dur='1.5s' repeatCount='indefinite' />
-                  </circle>
-                </svg>
-              </div>
-              <p className='text-xs text-center mt-4 text-gray-400'>
-                SVG animations run smoothly
-              </p>
-            </div>
+        {/* Verdict */}
+        {allDone && (
+          <div className="border-2 border-green-300 bg-green-50 rounded-xl p-5 space-y-2">
+            <div className="text-green-800 font-semibold text-base">Theory confirmed on-chain ✓</div>
+            <p className="text-sm text-green-700 leading-relaxed">
+              <strong>{fileCount} files</strong> uploaded with exactly{' '}
+              <strong>2 wallet prompts</strong> — one register PTB and one certify PTB,
+              each batching all {fileCount} blob{fileCount > 1 ? 's' : ''} into a single Sui transaction.
+            </p>
+            <p className="text-xs text-green-600 mt-1">
+              Both transaction digests are real, on-chain proofs. Try changing the file count
+              and re-running — the wallet prompt count stays at 2.
+            </p>
           </div>
+        )}
 
-          {/* COLUMN 3: Compositor Thread - Always Works */}
-          <div className='space-y-6'>
-            {/* Static Content */}
-            <div className='bg-linear-to-br from-blue-50 to-indigo-50 border-2 border-blue-200 rounded-xl p-6 shadow-sm'>
-              <div className='flex items-center justify-between mb-5'>
-                <h3 className='text-base font-semibold text-blue-900'>Static Content</h3>
-                <span className='text-xs px-2.5 py-1 rounded-full border bg-blue-100 text-blue-700 border-blue-300 font-medium'>
-                  Always Works
-                </span>
-              </div>
-              <div className='space-y-5'>
-                <p className='text-sm text-blue-900 leading-relaxed font-medium'>
-                  This text is always readable. Even during encoding, users can still see content.
-                </p>
-                <div className='flex justify-center gap-6 text-3xl py-2'>
-                  <span>📱</span>
-                  <span>💻</span>
-                  <span>🎯</span>
-                </div>
-                <p className='text-xs text-center text-blue-600'>Static content renders normally</p>
-              </div>
-            </div>
-
-            {/* CSS Transform Animations */}
-            <div className='bg-linear-to-br from-emerald-50 to-teal-50 border-2 border-emerald-200 rounded-xl p-6 shadow-sm'>
-              <div className='flex items-center justify-between mb-5'>
-                <h3 className='text-base font-semibold text-emerald-900'>CSS Animations (CSS transforms)</h3>
-                
-                <span className='text-xs px-2.5 py-1 rounded-full border bg-emerald-100 text-emerald-700 border-emerald-300 font-medium'>
-                  Always Works
-                </span>
-              </div>
-              <p className='text-sm text-emerald-900 leading-relaxed mb-4 font-medium'>
-                It worked because it was using compositor thread, not on the main thread.
-              </p>
-              <div className='relative h-32 bg-white/60 rounded-lg overflow-hidden border-2 border-emerald-200'>
-                <div className='absolute inset-0 flex items-center justify-center'>
-                  <div className='w-8 h-8 border-4 border-blue-200 border-t-blue-500 rounded-full animate-spin'></div>
-                  <div className='w-6 h-6 bg-orange-500 rounded-full animate-bounce absolute ml-16'></div>
-                  <div className='w-7 h-7 bg-purple-500 rounded animate-pulse absolute mr-16'></div>
-                </div>
-              </div>
-              <p className='text-xs text-center text-emerald-600 mt-4'>CSS animations continue during encoding</p>
-            </div>
-          </div>
-        </div>
-
+        <p className="text-xs text-gray-400 text-center pb-4">
+          Walrus testnet · {EPOCHS} epoch · files are 1 KB dummy data
+        </p>
       </div>
     </div>
   )

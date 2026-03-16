@@ -9,8 +9,10 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@mysten/dapp-kit": "^1.0.4",
     "@mysten/sui": "^1.45.2",
     "@mysten/walrus": "^0.9.0",
+    "@tanstack/react-query": "^5.90.21",
     "next": "16.0.10",
     "react": "19.2.1",
     "react-dom": "19.2.1"
